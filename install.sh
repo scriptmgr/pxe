@@ -29,7 +29,8 @@ IPXE_DIR="${PREFIX_DIR}/ipxe"
 SYS_DIR="${PREFIX_DIR}/syslinux"
 EFI_DIR="${PREFIX_DIR}/efi"
 MENU_DIR="${HTTP_ROOT}/menus"
-ISO_SCAN_DIR="/mnt/ISOs"
+ISO_SCAN_DIR="/mnt/ISOs"   # legacy / custom mount point (always checked)
+ISO_HTTP_DIR="${HTTP_ROOT}/isos"  # served root — contains per-source subdirs
 
 # ─── Network ──────────────────────────────────────────────────────────────────
 HOST_IP=""
@@ -450,13 +451,62 @@ __place_sample_tools() {
   __fetch_or_warn "memtest86+" "$MEMTEST_URL" "${HTTP_ROOT}/tools/memtest86+.bin.gz" || true
 }
 
+# __detect_iso_dirs — echo "label:path" for every ISO source directory found
+__detect_iso_dirs() {
+  # Custom / manual mount (original default)
+  [[ -d "$ISO_SCAN_DIR" ]] && printf '%s\n' "custom:${ISO_SCAN_DIR}"
+
+  # ── Proxmox VE ─────────────────────────────────────────────────────────────
+  # Local storage pool
+  [[ -d "/var/lib/vz/template/iso" ]] && printf '%s\n' "proxmox:/var/lib/vz/template/iso"
+  # Shared/external storage pools mounted under /mnt/pve/<pool>/template/iso
+  for _pve_pool in /mnt/pve/*/template/iso; do
+    [[ -d "$_pve_pool" ]] && printf '%s\n' "pve-$(basename "$(dirname "$(dirname "$_pve_pool")")")":"$_pve_pool"
+  done
+
+  # ── libvirt / QEMU-KVM ─────────────────────────────────────────────────────
+  [[ -d "/var/lib/libvirt/images" ]] && printf '%s\n' "libvirt:/var/lib/libvirt/images"
+  [[ -d "/var/lib/libvirt/boot"   ]] && printf '%s\n' "libvirt-boot:/var/lib/libvirt/boot"
+
+  # ── XCP-ng / XenServer ─────────────────────────────────────────────────────
+  [[ -d "/var/opt/xen/ISO_Store" ]] && printf '%s\n' "xcpng:/var/opt/xen/ISO_Store"
+  # ISO SRs mounted at /run/sr-mount/<uuid>/ — only include if they contain ISOs
+  for _sr in /run/sr-mount/*/; do
+    [[ -d "$_sr" ]] || continue
+    find "$_sr" -maxdepth 2 -name '*.iso' -quit 2>/dev/null && \
+      printf '%s\n' "xen-sr-${_sr##/run/sr-mount/}":"$_sr"
+  done
+}
+
+# __expose_isos_via_http — create per-source symlinks under $ISO_HTTP_DIR
 __expose_isos_via_http() {
-  if [[ -d "$ISO_SCAN_DIR" ]]; then
-    if [[ ! -L "${HTTP_ROOT}/isos" ]]; then
-      \rm -rf "${HTTP_ROOT}/isos" 2>/dev/null || true
-      \ln -s "$ISO_SCAN_DIR" "${HTTP_ROOT}/isos"
-      __log_ok "ISO directory symlinked: ${ISO_SCAN_DIR} → ${HTTP_ROOT}/isos"
+  __log_sep "ISO Source Detection"
+
+  # If old flat symlink exists from a previous version, remove it
+  if [[ -L "${HTTP_ROOT}/isos" ]]; then
+    \rm -f "${HTTP_ROOT}/isos"
+  fi
+  \install -d -m 0755 "$ISO_HTTP_DIR"
+
+  local found=0
+  local label path link
+  while IFS=: read -r label path; do
+    [[ -d "$path" ]] || continue
+    link="${ISO_HTTP_DIR}/${label}"
+    if [[ -L "$link" && "$(readlink "$link")" == "$path" ]]; then
+      __log_ok "ISO source [${label}] already linked: ${path}"
+    else
+      \rm -rf "$link" 2>/dev/null || true
+      \ln -s "$path" "$link"
+      __log_ok "ISO source [${label}]: ${path}"
     fi
+    found=$(( found + 1 ))
+  done < <(__detect_iso_dirs)
+
+  if (( found == 0 )); then
+    __log_warn "No ISO source directories found. Place ISOs under ${ISO_SCAN_DIR} or a supported hypervisor path."
+  else
+    __log_info "Total ISO sources linked: ${found}"
   fi
 }
 
@@ -1048,37 +1098,68 @@ EOF
 
 __build_iso_auto_menu() {
   local iso_menu="${MENU_DIR}/iso-auto.ipxe"
-  __log_info "Scanning ${ISO_SCAN_DIR} for ISOs"
+  __log_info "Building ISO auto-discovery menu from ${ISO_HTTP_DIR}"
 
+  # Collect all ISO entries: array of "key|label_source|display_name|url_path"
+  local -a iso_entries=()
+  local total=0 src_label src_link iso rel urlpath key display
+
+  for src_link in "${ISO_HTTP_DIR}"/*/; do
+    [[ -d "$src_link" ]] || continue
+    src_label="$(basename "$src_link")"
+    while IFS= read -r -d '' iso; do
+      rel="${iso#${src_link}}"
+      urlpath="${src_label}/${rel// /%20}"
+      key="iso$(( ++total ))"
+      display="[${src_label}]  ${rel}"
+      iso_entries+=("${key}|${src_label}|${display}|${urlpath}|${iso}")
+    done < <(find "$src_link" -type f -iname '*.iso' -print0 2>/dev/null | \sort -z)
+  done
+
+  # ── Write menu header ───────────────────────────────────────────────────────
   \cat >"$iso_menu" <<EOF
 #!ipxe
 ###############################################################################
 #  ISO Auto-Discovery  (BIOS only — memdisk)
-#  Source: ${ISO_SCAN_DIR}
+#  Sources: ${ISO_HTTP_DIR}/*/
+#  ${total} ISO(s) discovered across all hypervisor/custom directories
 ###############################################################################
 
 set sys-tftp  tftp://${HOST_IP}/syslinux
 set base-url  http://${HOST_IP}:${HTTP_PORT}
 
 :iso_auto
-menu  ISO Boot Menu  [ BIOS / memdisk only ]
+menu  ISO Boot  [ BIOS / memdisk only ]  ${total} image(s) found
 item --gap --
-item --gap --    +---------[ Discovered ISO Files ]-------------------------------------+
 EOF
 
-  local count=0
-  if [[ -d "$ISO_SCAN_DIR" ]]; then
-    while IFS= read -r -d '' iso; do
-      local rel="${iso#${ISO_SCAN_DIR}/}"
-      local key="iso$((++count))"
-      printf 'item %-12s %s\n' "${key}" "${rel}" >>"$iso_menu"
-    done < <(find "$ISO_SCAN_DIR" -type f -iname '*.iso' -print0 | \sort -z)
+  # ── Write menu items grouped by source ──────────────────────────────────────
+  local last_src="" entry k s d u f
+  if (( total == 0 )); then
+    printf 'item --gap -- (no ISO files found — place ISOs under %s or a hypervisor path)\n' \
+      "$ISO_SCAN_DIR" >>"$iso_menu"
+  else
+    for entry in "${iso_entries[@]}"; do
+      IFS='|' read -r k s d u f <<< "$entry"
+      if [[ "$s" != "$last_src" ]]; then
+        # Section header per source
+        printf 'item --gap --\n' >>"$iso_menu"
+        case "$s" in
+          proxmox*)    printf 'item --gap --    +-[ Proxmox VE: %s ]-\n' "$s" >>"$iso_menu" ;;
+          pve-*)       printf 'item --gap --    +-[ Proxmox Pool: %s ]-\n' "${s#pve-}" >>"$iso_menu" ;;
+          libvirt*)    printf 'item --gap --    +-[ libvirt / QEMU-KVM: %s ]-\n' "$s" >>"$iso_menu" ;;
+          xcpng*)      printf 'item --gap --    +-[ XCP-ng / XenServer ]-\n' >>"$iso_menu" ;;
+          xen-sr-*)    printf 'item --gap --    +-[ XCP-ng SR: %s ]-\n' "${s#xen-sr-}" >>"$iso_menu" ;;
+          custom*)     printf 'item --gap --    +-[ Custom / Manual: %s ]-\n' "$ISO_SCAN_DIR" >>"$iso_menu" ;;
+          *)           printf 'item --gap --    +-[ %s ]-\n' "$s" >>"$iso_menu" ;;
+        esac
+        last_src="$s"
+      fi
+      printf 'item %-14s %s\n' "$k" "$d" >>"$iso_menu"
+    done
   fi
 
-  if (( count == 0 )); then
-    printf 'item --gap -- (no ISO files found under %s)\n' "$ISO_SCAN_DIR" >>"$iso_menu"
-  fi
-
+  # ── Footer ──────────────────────────────────────────────────────────────────
   \cat >>"$iso_menu" <<'ISOEOF'
 item --gap --
 item back     Back to Tools Menu
@@ -1087,24 +1168,21 @@ choose --default back --timeout ${submenu-timeout} selected || goto back
 iseq ${selected} back && goto back || goto ${selected}
 ISOEOF
 
-  count=0
-  if [[ -d "$ISO_SCAN_DIR" ]]; then
-    while IFS= read -r -d '' iso; do
-      count=$((count+1))
-      local key="iso${count}"
-      local rel="${iso#${ISO_SCAN_DIR}/}"
-      local urlpath="${rel// /%20}"
-      \cat >>"$iso_menu" <<EOF
+  # ── Boot stanzas ────────────────────────────────────────────────────────────
+  local entry k s d u f
+  for entry in "${iso_entries[@]}"; do
+    IFS='|' read -r k s d u f <<< "$entry"
+    \cat >>"$iso_menu" <<EOF
 
-:${key}
-# BIOS-only ISO boot via memdisk (not supported on UEFI)
+:${k}
+# BIOS-only ISO boot via memdisk (UEFI not supported for raw ISO)
+# Source: ${f}
 kernel tftp://${HOST_IP}/syslinux/memdisk
-initrd http://${HOST_IP}:${HTTP_PORT}/isos/${urlpath}
+initrd http://${HOST_IP}:${HTTP_PORT}/isos/${u}
 imgargs memdisk iso raw
 boot || goto iso_auto
 EOF
-    done < <(find "$ISO_SCAN_DIR" -type f -iname '*.iso' -print0 | \sort -z)
-  fi
+  done
 
   \cat >>"$iso_menu" <<EOF
 
@@ -1112,7 +1190,7 @@ EOF
 chain http://${HOST_IP}:${HTTP_PORT}/menus/tools.ipxe
 EOF
 
-  __log_ok "ISO auto-menu generated (${count} ISO(s) found)"
+  __log_ok "ISO auto-menu generated — ${total} ISO(s) across $(ls -1 "${ISO_HTTP_DIR}" 2>/dev/null | wc -l) source(s)"
 }
 
 # ─── Service setup ────────────────────────────────────────────────────────────
@@ -1259,9 +1337,40 @@ __print_dhcp_hints() {
 │  Logs : journalctl -u ${TFTP_SERVICE_NAME}
 └───────────────────────────────────────────────────────────────
 
+┌─ ISO Sources (auto-detected) ─────────────────────────────────
+EOF
+
+  # List every linked ISO source
+  local iso_found=0
+  local lbl
+  for lbl in "${ISO_HTTP_DIR}"/*/; do
+    [[ -d "$lbl" ]] || continue
+    local src_name iso_count
+    src_name="$(basename "$lbl")"
+    iso_count=$(find "$lbl" -type f -iname '*.iso' 2>/dev/null | wc -l)
+    printf '│  %-14s → %s  (%s ISO(s))\n' "$src_name" "$(readlink "$lbl")" "$iso_count"
+    iso_found=$(( iso_found + 1 ))
+  done
+
+  if (( iso_found == 0 )); then
+    printf '│  (none detected — place ISOs under %s\n' "$ISO_SCAN_DIR"
+    printf '│   or a supported hypervisor path and re-run)\n'
+  fi
+
+  \cat <<EOF
+│
+│  Re-run this script any time to refresh iso-auto.ipxe after
+│  adding or removing ISO files.
+└───────────────────────────────────────────────────────────────
+
 ┌─ Adding Content ──────────────────────────────────────────────
-│  ISOs      : Place *.iso files under ${ISO_SCAN_DIR}
-│              Re-run script to regenerate iso-auto.ipxe
+│  ISOs      : Supported auto-detected paths:
+│               /mnt/ISOs                         (custom)
+│               /var/lib/vz/template/iso          (Proxmox local)
+│               /mnt/pve/<pool>/template/iso      (Proxmox shared)
+│               /var/lib/libvirt/images           (libvirt/KVM)
+│               /var/opt/xen/ISO_Store            (XCP-ng)
+│               /run/sr-mount/<uuid>/             (XCP-ng ISO SR)
 │  Windows   : Copy bootmgr, BCD, boot.sdi, boot.wim to
 │              ${HTTP_ROOT}/windows/winpe/
 │  BSD       : Place kernel + mfsroot.gz under
