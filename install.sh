@@ -30,7 +30,10 @@ SYS_DIR="${PREFIX_DIR}/syslinux"
 EFI_DIR="${PREFIX_DIR}/efi"
 MENU_DIR="${HTTP_ROOT}/menus"
 ISO_SCAN_DIR="/mnt/ISOs"   # legacy / custom mount point (always checked)
-ISO_HTTP_DIR="${HTTP_ROOT}/isos"  # served root — contains per-source subdirs
+ISO_HTTP_DIR="${HTTP_ROOT}/isos"  # served root — contains per-source subdirs (Python fallback)
+
+# Populated by __expose_isos_via_http; consumed by __setup_http and __build_iso_auto_menu
+declare -A ISO_SOURCES_MAP=()
 
 # ─── Network ──────────────────────────────────────────────────────────────────
 HOST_IP=""
@@ -202,7 +205,7 @@ __detect_fedora() {
   __log_info "Detecting latest Fedora stable release"
   FEDORA_VERSION=$(\curl -fsSL --max-time 15 \
     "https://dl.fedoraproject.org/pub/fedora/linux/releases/" 2>/dev/null | \
-    \grep -oE 'href="[0-9]+/"' | \grep -oE '[0-9]+' | \sort -n | \tail -1 || true)
+    \grep -oE -- 'href="[0-9]+/"' | \grep -oE -- '[0-9]+' | \sort -n | \tail -1 || true)
   if [[ -n "$FEDORA_VERSION" ]]; then
     __log_ok "Fedora ${FEDORA_VERSION}"
   else
@@ -214,7 +217,7 @@ __detect_almalinux() {
   __log_info "Detecting latest AlmaLinux stable release"
   ALMALINUX_VERSION=$(\curl -fsSL --max-time 15 \
     "https://repo.almalinux.org/almalinux/" 2>/dev/null | \
-    \grep -oE 'href="[0-9]+\.[0-9]+/"' | \grep -oE '[0-9]+\.[0-9]+' | \sort -V | \tail -1 || true)
+    \grep -oE -- 'href="[0-9]+\.[0-9]+/"' | \grep -oE -- '[0-9]+\.[0-9]+' | \sort -V | \tail -1 || true)
   if [[ -n "$ALMALINUX_VERSION" ]]; then
     __log_ok "AlmaLinux ${ALMALINUX_VERSION}"
   else
@@ -301,7 +304,7 @@ __fetch_ubuntu_netboot() {
   local tarball
   # Find the latest point release tarball on the releases page
   tarball=$(\curl -fsSL --max-time 15 "https://releases.ubuntu.com/${UBUNTU_VERSION}/" 2>/dev/null | \
-    \grep -oE "ubuntu-${UBUNTU_VERSION}[.0-9]*-netboot-amd64[.]tar[.]gz" | \
+    \grep -oE -- "ubuntu-${UBUNTU_VERSION}[.0-9]*-netboot-amd64[.]tar[.]gz" | \
     \sort -V | \tail -1 || true)
   [[ -z "$tarball" ]] && tarball="ubuntu-${UBUNTU_VERSION}-netboot-amd64.tar.gz"
 
@@ -478,35 +481,37 @@ __detect_iso_dirs() {
   done
 }
 
-# __expose_isos_via_http — create per-source symlinks under $ISO_HTTP_DIR
+# __expose_isos_via_http — detect ISO sources and:
+#   1. Populate ISO_SOURCES_MAP (label -> real path) — used by nginx and menu builder
+#   2. Create per-source symlinks under $ISO_HTTP_DIR  — used by Python http.server fallback only
+#      nginx does NOT rely on these symlinks; it uses alias blocks generated from ISO_SOURCES_MAP
 __expose_isos_via_http() {
   __log_sep "ISO Source Detection"
+  ISO_SOURCES_MAP=()
 
-  # If old flat symlink exists from a previous version, remove it
-  if [[ -L "${HTTP_ROOT}/isos" ]]; then
-    \rm -f "${HTTP_ROOT}/isos"
-  fi
+  # Remove old flat symlink from v1 if present
+  [[ -L "${HTTP_ROOT}/isos" ]] && \rm -f "${HTTP_ROOT}/isos"
   \install -d -m 0755 "$ISO_HTTP_DIR"
 
-  local found=0
   local label path link
   while IFS=: read -r label path; do
     [[ -d "$path" ]] || continue
+    ISO_SOURCES_MAP["$label"]="$path"
+
+    # Symlink for Python http.server fallback only
     link="${ISO_HTTP_DIR}/${label}"
-    if [[ -L "$link" && "$(readlink "$link")" == "$path" ]]; then
-      __log_ok "ISO source [${label}] already linked: ${path}"
-    else
+    if [[ ! -L "$link" || "$(readlink "$link")" != "$path" ]]; then
       \rm -rf "$link" 2>/dev/null || true
       \ln -s "$path" "$link"
-      __log_ok "ISO source [${label}]: ${path}"
     fi
-    found=$(( found + 1 ))
+    __log_ok "ISO source [${label}]: ${path}"
   done < <(__detect_iso_dirs)
 
-  if (( found == 0 )); then
-    __log_warn "No ISO source directories found. Place ISOs under ${ISO_SCAN_DIR} or a supported hypervisor path."
+  local count="${#ISO_SOURCES_MAP[@]}"
+  if (( count == 0 )); then
+    __log_warn "No ISO sources found. Place ISOs under ${ISO_SCAN_DIR} or a supported hypervisor path."
   else
-    __log_info "Total ISO sources linked: ${found}"
+    __log_info "${count} ISO source(s) detected"
   fi
 }
 
@@ -1224,17 +1229,36 @@ __setup_http() {
   __log_sep "HTTP Service"
   if \command -v nginx >/dev/null 2>&1; then
     __log_info "Configuring nginx to serve ${HTTP_ROOT} on :80"
-    \cat >"/etc/nginx/conf.d/ipxe.conf" <<EOF
+    # Build config dynamically: base server block + per-ISO-source alias locations.
+    # Alias blocks are used instead of docroot symlinks so nginx disable_symlinks
+    # policies (common on hardened distros) do not block ISO serving.
+    {
+      \cat <<EOF
 server {
     listen 80 default_server;
     server_name _;
     root ${HTTP_ROOT};
     autoindex on;
+
     location / {
         try_files \$uri \$uri/ =404;
     }
-}
+
+    # ISO sources — served via alias, not docroot symlinks
 EOF
+      local _label _path
+      for _label in "${!ISO_SOURCES_MAP[@]}"; do
+        _path="${ISO_SOURCES_MAP[$_label]}"
+        \cat <<EOF
+
+    location /isos/${_label}/ {
+        alias ${_path}/;
+        autoindex on;
+    }
+EOF
+      done
+      echo "}"
+    } >"/etc/nginx/conf.d/ipxe.conf"
     \systemctl enable --now nginx || true
     HTTP_PORT="80"
     __log_ok "nginx configured on :80"
